@@ -1,0 +1,1 @@
+ll code needed to build the trained and validated prognostic risk models using the PetuL (Peritumoral Lymphocyte) index and IntuL (Intratumoral Lymphocyte) index imaging markers. PetuL and IntuL values are stored in TCGA_clinical_removeThyroiditis.xls, computed from binary masks generated in QuickAnnotator  (https://github.com/choosehappy/QuickAnnotator).
