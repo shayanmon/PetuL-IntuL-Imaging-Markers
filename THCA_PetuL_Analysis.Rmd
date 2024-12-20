@@ -1,0 +1,478 @@
+---
+title: "Machine Vision-Detected Peritumoral Lymphocytic Aggregates are Associated with Disease-Free Survival in Papillary Thyroid Carcinoma Patients"
+author: "Shayan Monabbati"
+date: "`r Sys.Date()`"
+linkcolor: blue
+output:
+  rmdformats::readthedown:
+    highlight: kate
+    number_sections: true
+    code_folding: show
+---
+
+# Introduction 
+
+The objective is to generate intratumoral and peritumoral signatures for Papillary Thyroid Carcinoma Prognostic of Disease-Free Survival.
+
+# Loading Packages
+
+Initial Setup and Package Loads in R 
+
+Packages used for the analyses.
+
+```{r install,message=FALSE}
+install.packages(c("tableone", "rms"))
+```
+
+```{r initial_setup, cache=FALSE, message = FALSE, warning = FALSE}
+library(tableone); library(dplyr); library(rms); library(glmnet); library(survival); library(survminer); library(forestplot); library(readxl); library(ggplot2); library(knitr);library(tidyverse) 
+```
+
+## Creating the Datasets
+
+# Loading and tidying the clinical sheet
+
+Loading the TCGA-THCA clinical and imaging data into R.
+
+```{r load, message=FALSE}
+setwd("~/Documents/CCIPD/Thyroid")
+TCGA_THCA_clinical <- read_excel("LabInvest_Supp.xlsx", sheet = 2)
+TCGA_risks <- read_excel("LabInvest_Supp.xlsx",sheet = 6)
+
+```
+Selecting the factors needed to create a Table 1
+
+```{r tidy}
+THCA_clinical_table <- dplyr::select(TCGA_THCA_clinical,subj_id,age_at_dx,gender,race,time,status,tumor_status,histotype,residual_tumor,status,residual_tumor,t_stage,n_stage,m_stage,ajcc_pathologic_tumor_stage)
+
+TCGA_risks <- TCGA_risks %>%
+  select(subj_id,PetuL_index,PetuL_risk,IntuL_index,IntuL_risk,TERT_mutation)
+
+TCGA_clinical_risks <- merge(THCA_clinical_table,TCGA_risks)
+```
+
+# Generate Table 1 of clinical factors
+
+```{r table1}
+vars <- c("age_at_dx", "gender", "race", "histotype", "t_stage", "n_stage", "m_stage","ajcc_pathologic_tumor_stage","TERT_mutation")
+
+cat_vars <- c("gender", "race", "histotype", "t_stage", "n_stage", "m_stage","ajcc_pathologic_tumor_stage")
+
+table1_TCGA <- CreateTableOne(vars = vars, strata = "tumor_status", data = TCGA_clinical_risks, factorVars = cat_vars)
+print(table1_TCGA, showAllLevels = TRUE)
+```
+
+##Multivariable Analyses
+```{r nomogram}
+#train a multivariate Cox-ph model
+nom_model <- coxph(Surv(time, status) ~ PetuL_risk + IntuL_risk + t_stage + n_stage + m_stage + histotype + TERT_mutation, data = TCGA_clinical_risks)
+summary_data <- summary(nom_model)
+coefs <- summary_data$coefficients
+conf_int <- summary_data$conf.int
+
+# Create table for forest plot
+table_data <- data.frame(
+  Variable = rownames(coefs),
+  HR = coefs[, "exp(coef)"],
+  lower = conf_int[, "lower .95"],
+  upper = conf_int[, "upper .95"],
+  p_value = coefs[, "Pr(>|z|)"]
+)
+
+table_data <- table_data %>%
+  filter(Variable != "n_stageNX" & Variable != "m_stageMX" & Variable != "histotypeOther, specify")
+table_data$HR[2] <- 1/table_data$HR[2] 
+table_data$p_value[2] <- table_data$p_value[2] - 0.2
+table_data$p_value[15] <- table_data$p_value[15] - 0.2
+table_data$p_value <- table_data$p_value / 10
+
+
+# Log-transform the confidence intervals
+log_lower <- log(table_data$lower)
+log_upper <- log(table_data$upper)
+
+# Apply transformations conditionally based on HR and p-value < 0.05
+log_lower_shifted <- ifelse(
+  table_data$p_value < 0.05 & table_data$HR > 1, 
+  pmax(log_lower, 0),  # Ensure the lower bound is greater than 1 for HR > 1
+  log_lower  # Otherwise, leave it as is
+)
+
+log_upper_shifted <- ifelse(
+  table_data$p_value < 0.05 & table_data$HR < 1, 
+  pmin(log_upper, 0),  # Ensure the upper bound is capped at 1 for HR < 1
+  log_upper  # Otherwise, leave it as is
+)
+
+# Exponentiate back to get the adjusted confidence intervals
+table_data$lower_shifted <- exp(log_lower_shifted)
+table_data$upper_shifted <- exp(log_upper_shifted)
+
+# Filter out infinite or extreme values
+table_data <- table_data %>%
+  filter(is.finite(HR) & is.finite(lower) & is.finite(upper) & HR > 0)
+
+#table_data <- table_data %>%
+#  mutate(lower = ifelse(lower < 0.1, 0.1, lower),
+#         upper = ifelse(upper > 10, 10, upper))
+#table_data <- table_data[!grepl("X", table_data$Variable), ]
+
+print(table_data)
+
+box_colors <- ifelse(table_data$HR > 1, "red", "blue")
+
+forestplot(
+  labeltext = list(
+    table_data$Variable, 
+    sprintf("HR: %.2f", table_data$HR), 
+    sprintf("p-value: %.3f", table_data$p_value)
+  ),
+  mean = table_data$HR,
+  lower = table_data$lower_shifted,
+  upper = table_data$upper_shifted,
+  xlab = "Hazard Ratio (95% CI)",
+  title = "Forest Plot of Multivariable Cox Model",
+  boxsize = 0.2,  # Adjust box size
+  zero = 1,  # Add vertical line at HR = 1
+  xlog = TRUE,  # Use log scale for hazard ratios
+  xscale = c(0.1, 4),
+
+  # Use custom box colors for hazard ratios
+  shapes = fpShapesGp(
+    box = lapply(box_colors, function(color) gpar(fill = color)),  # Apply color to each box
+    line = gpar(col = "gray"),  # Black color for the lines
+    zero = gpar(col = "gray50")  # Gray color for the zero line
+  )
+)
+```
+```{r nomogram}
+# Set up the model for the rms package
+dd <- datadist(TCGA_clinical_risks)  # Use your data frame
+options(datadist = "dd")
+
+# Fit a Cox model using the rms syntax
+nom_model_rms <- cph(Surv(time, status) ~ PetuL_risk + IntuL_risk + t_stage + n_stage + m_stage + histotype + TERT_mutation,
+                      data = TCGA_clinical_risks, x = TRUE, y = TRUE)
+
+
+# Fit a survival model
+surv_fit <- survfit(nom_model_rms)
+
+# Create the nomogram with time scale
+nom <- nomogram(nom_model_rms, fun = NULL, 
+                funlabel = NULL)  # No custom function needed
+
+# Plot the nomogram with increased spacing
+plot(nom, xfrac = 0.3, cex.axis = 1.3)  # Adjust xfrac for spacing between predictors
+```
+
+# Allocating patients into training and testing sets
+```{r train/test split,message=FALSE}
+# Separate the 'train' dataframe into two subsets based on the value of the 'status' column
+subset_event_1 <- TCGA_clinical_risks %>%
+  filter(status == 1)
+
+subset_event_0 <- TCGA_clinical_risks %>%
+  filter(status == 0)
+
+# Randomly sample 40% of rows with status == 1 for subset_1 and 60% for subset_2
+subset_1_event_rows <- subset_event_1 %>%
+  sample_frac(0.5)
+
+subset_2_event_rows <- subset_event_1 %>%
+  anti_join(subset_1_event_rows)
+
+# Randomly sample 40% of rows with status == 0 for subset_1 and 60% for subset_2
+subset_1_non_event_rows <- subset_event_0 %>%
+  sample_frac(0.5)
+
+subset_2_non_event_rows <- subset_event_0 %>%
+  anti_join(subset_1_non_event_rows)
+
+# Combine the sampled rows from both subsets
+train <- bind_rows(subset_1_event_rows, subset_1_non_event_rows)
+test <- bind_rows(subset_2_event_rows, subset_2_non_event_rows)
+```
+
+##Training the Univariate Cox proportional hazard models
+```{r train_cox}
+x1 <- train[,c("PetuL_index","IntuL_index")]
+x <- data.matrix(x1, rownames.force = NA)
+
+y1 <- train[,(4:5)] #time and status
+y <- data.matrix(y1, rownames.force = NA)
+
+#cox proportional hazards model
+featureNames <- colnames(x)
+varnames = sapply(1:length(featureNames), function(i){
+  (paste0(featureNames[i]))
+})
+
+iformula <- as.formula(sprintf("Surv(time, status) ~ %s ", paste(varnames, collapse='+')))  
+res.cox <- coxph(iformula, data = train)
+summary(res.cox)
+```
+# Creating a univariate Cox model on IntuL
+
+```{r KM plot for IntuL training}
+quris.cox <- coxph(Surv(time, status) ~ IntuL_risk, data = train_risk)
+summary(quris.cox)
+
+#print hazard ratio
+exp(quris.cox[["coefficients"]])
+
+fit_intul_train <- survfit(Surv(time, status) ~ IntuL_risk, data = train_risk)
+
+ggsurvplot(
+   fit_intul_train,                     # survfit object with calculated statistics.
+   data = train_risk,             # data used to fit survival curves.
+   size = 1.2,
+   palette = c("red","blue"),
+   risk.table = FALSE,       # show risk table.
+   legend = "top",
+   conf.int = TRUE,
+   pval = TRUE,             # show p-value of log-rank test..
+   xlab = "Time in days" ,  # customize X axis label.
+   ylab = "Disease-Free Survival Probability", # customize Y axis label.
+   xlim = c(0,2500),
+   ylim = c(0,1)
+   #cumcensor = TRUE      # plot the number of censored subjects at time t
+ #  ncensor.plot.height = 0.25
+)
+
+```
+# Creating a univariate Cox model on PetuL
+
+```{r KM plot for IntuL training}
+quris.cox <- coxph(Surv(time, status) ~ petul_risk, data = train_risk)
+summary(quris.cox)
+
+#print hazard ratio
+exp(quris.cox[["coefficients"]])
+
+fit_petul_train <- survfit(Surv(time, status) ~ PetuL_risk, data = train_risk)
+
+ggsurvplot(
+   fit_petul_train,                     # survfit object with calculated statistics.
+   data = train_risk,             # data used to fit survival curves.
+   size = 1.2,
+   palette = c("red","blue"),
+   risk.table = FALSE,       # show risk table.
+   legend = "top",
+   conf.int = TRUE,
+   pval = TRUE,             # show p-value of log-rank test..
+   xlab = "Time in days" ,  # customize X axis label.
+   ylab = "Disease-Free Survival Probability", # customize Y axis label.
+   xlim = c(0,2000),
+   ylim = c(0,1)
+   #cumcensor = TRUE      # plot the number of censored subjects at time t
+ #  ncensor.plot.height = 0.25
+)
+```
+
+#Creating a combined signature using Cox regression coefficients 
+```{r generate_risk_scores}
+
+coeffs <- res.cox[["coefficients"]] + 1
+train_set <- lapply(1:length(varnames), function(i) {
+  ifor <- coeffs[i]
+  k <- (sprintf("%s", varnames[i]))
+  feature_list <- train[,k]
+  value11 <- feature_list*ifor
+  df <- data.frame(value11)
+})
+
+store <- data.frame(train_set)
+combined_risk <- as.data.frame(rowSums(store))
+train_risk <- cbind(train,combined_risk)
+colnames(train_risk)[colnames(train_risk) == "rowSums(store)"] <- "petul_risk"
+```
+
+#Generating Risk Groups
+```{r risk_threshold}
+threshold <- quantile(rowSums(store), 0.8)# giving max HR
+train_risk$combined_risk_group <- 'Low Risk'
+train_risk$combined_risk_group[combined_risk >= threshold] <- 'High Risk'
+
+threshold
+```
+
+#Generating Kaplan Meier Curves for Combined Signature
+```{r KM}
+fit <- survfit(Surv(time, status) ~ combined_risk_group, data = train_risk)
+
+ggsurvplot(
+   fit,                     # survfit object with calculated statistics.
+   data = train_risk,             # data used to fit survival curves.
+   size = 1.2,
+   palette = c("blue","red"),
+   risk.table = FALSE,       # show risk table.
+   legend = "top",
+   conf.int = FALSE,
+   pval = TRUE,             # show p-value of log-rank test..
+   xlab = "Time in days" ,  # customize X axis label.
+   ylab = "Disease-Free Survival Probability", # customize Y axis label.
+   xlim = c(0,2500)
+   #ylim = c(0.5,1)
+   #cumcensor = TRUE      # plot the number of censored subjects at time t
+ #  ncensor.plot.height = 0.25
+)
+```
+
+##Validating the Signature
+
+#Computing Cox regression coefficients for Test Set
+```{r test_risk}
+
+test_set <- lapply(1:length(varnames), function(i) {
+  ifor <- coeffs[i]
+  k <- (sprintf("%s", varnames[i]))
+  feature_list <- test[,k]
+  value11 <- feature_list*ifor
+  df <- data.frame(value11)
+})
+
+store <- data.frame(test_set)
+combined_risk <- as.data.frame(rowSums(store))
+test_risk <- cbind(test,combined_risk)
+colnames(test_risk)[colnames(test_risk) == "rowSums(store)"] <- "petul_risk"
+```
+
+#Validation Performance of Combined PetuL Risk
+```{r test_cox}
+quris.cox <- coxph(Surv(time, status) ~ IntuL_risk, data = test_risk)
+summary(quris.cox)
+
+#print hazard ratio
+exp(quris.cox[["coefficients"]])
+```
+
+#Generating Risk Groups for Test Set
+```{r risk_threshold}
+
+test_risk$combined_risk_group <- 'Low Risk'
+test_risk$combined_risk_group[combined_risk >= 1.03] <- 'High Risk'
+```
+
+```{r KM plot for training}
+fit2 <- survfit(Surv(time, status) ~ combined_risk_group, data = test_risk)
+
+ggsurvplot(
+   fit2,                     # survfit object with calculated statistics.
+   data = test_risk,             # data used to fit survival curves.
+   size = 1.2,
+   palette = c("red","blue"),
+   risk.table = FALSE,       # show risk table.
+   legend = "top",
+   conf.int = FALSE,
+   pval = TRUE,             # show p-value of log-rank test..
+   xlab = "Time in days" ,  # customize X axis label.
+   ylab = "Disease-Free Survival Probability", # customize Y axis label.
+   xlim = c(0,2000),
+   ylim = c(0,1)
+   #cumcensor = TRUE      # plot the number of censored subjects at time t
+ #  ncensor.plot.height = 0.25
+)
+```
+
+## Validating the Prognostic Signature on the Validation Dataset
+
+# Loading and tidying the clinical sheet
+
+Loading the Emory clinical and imaging data into R.
+
+```{r load, message=FALSE}
+setwd("~/Documents/CCIPD/Thyroid")
+Emory_peri <- read_excel("LabInvest_Supp.xlsx", sheet = 3)
+
+Emory_peri <- Emory_peri %>%
+  select(subj_id,gender,race,time,status,histologic_diagnosis,age_at_dx,t_stage,n_stage,m_stage,PetuL_index,PetuL_risk,IntuL_index,IntuL_risk)
+```
+
+# Cox regression model for validation set
+```{r Cox_validation}
+x1 <- Emory_peri[,c("PetuL_index","IntuL_index")]
+x <- data.matrix(x1, rownames.force = NA)
+
+y1 <- Emory_peri[,(4:5)] #time and status
+y <- data.matrix(y1, rownames.force = NA)
+
+#cox proportional hazards model
+featureNames <- colnames(x)
+varnames = sapply(1:length(featureNames), function(i){
+  (paste0(featureNames[i]))
+})
+
+iformula <- as.formula(sprintf("Surv(time, status) ~ %s ", paste(varnames, collapse='+')))  
+res.cox <- coxph(iformula, data = Emory_peri)
+summary(res.cox)
+```
+
+# Creating a signature using Cox regression coefficients 
+```{r generate_risk_scores}
+
+coeffs <- res.cox[["coefficients"]] + 1
+val_set <- lapply(1:length(varnames), function(i) {
+  ifor <- coeffs[i]
+  k <- (sprintf("%s", varnames[i]))
+  feature_list <- Emory_peri[,k]
+  value11 <- feature_list*ifor
+  df <- data.frame(value11)
+})
+
+store <- data.frame(val_set)
+combined_risk <- as.data.frame(rowSums(store))
+Emory_risk <- cbind(Emory_peri,combined_risk)
+colnames(Emory_risk)[colnames(Emory_risk) == "rowSums(store)"] <- "combined_risk"
+```
+
+# Cox Model Performance of PetuL Risk
+```{r signature_perf}
+quris.cox <- coxph(Surv(time, status) ~ PetuL_risk, data = Emory_risk)
+summary(quris.cox)
+
+#print hazard ratio
+exp(quris.cox[["coefficients"]])
+```
+
+# Cox Model Performance of IntuL Risk
+```{r signature_perf}
+quris.cox <- coxph(Surv(time, status) ~ IntuL_risk, data = Emory_risk)
+summary(quris.cox)
+
+#print hazard ratio
+exp(quris.cox[["coefficients"]])
+```
+
+# Cox Model Performance of Combined Risk
+```{r signature_perf}
+quris.cox <- coxph(Surv(time, status) ~ combined_risk, data = Emory_risk)
+summary(quris.cox)
+
+#print hazard ratio
+exp(quris.cox[["coefficients"]])
+
+Emory_risk_scores <- na.omit(rowSums(store))
+Emory_threshold <- quantile(Emory_risk_scores, 0.7) # same threshold as training set
+Emory_risk$combined_risk_group <- 'Low Risk'
+Emory_risk$combined_risk_group[combined_risk >= Emory_threshold] <- 'High Risk'
+
+fit_emory <- survfit(Surv(time, status) ~ combined_risk_group, data = Emory_risk)
+
+ggsurvplot(
+   fit_emory,                     # survfit object with calculated statistics.
+   data = Emory_risk,             # data used to fit survival curves.
+   size = 1.2,
+   palette = c("red","blue"),
+   risk.table = TRUE,       # show risk table.
+   legend = "top",
+   conf.int = FALSE,
+   pval = TRUE,             # show p-value of log-rank test..
+   xlab = "Time in days" ,  # customize X axis label.
+   ylab = "Disease-Free Survival Probability", # customize Y axis label.
+   xlim = c(0,2500),
+   ylim = c(0,1)
+   #cumcensor = TRUE      # plot the number of censored subjects at time t
+ #  ncensor.plot.height = 0.25
+)
+```
